@@ -62,3 +62,30 @@ for abonent, fio_lists in fio_by_group.items():
     print(f"Абонент {abonent}:")
     for group, fio_list in fio_lists.items():
         print(f"  Группа {group}: {fio_list}")
+import pandas as pd
+
+# Создание пустого списка для хранения данных
+combined_data = []
+
+# Объединение данных из unknown_stats и fio_by_group
+for abonent in unknown_stats:
+    stats_row = unknown_stats[abonent]
+    fio_row = fio_by_group[abonent]
+    
+    # Для каждой группы добавляем запись в итоговый датафрейм
+    for group in known_groups:
+        group_stats = stats_row.get(group, 0)
+        fio_list = fio_row.get(group, [])
+        
+        combined_data.append({
+            'абонент': abonent,
+            'группа': group,
+            'количество соединений': group_stats,
+            'список ФИО': fio_list
+        })
+
+# Создание результирующего датафрейма
+combined_df = pd.DataFrame(combined_data)
+
+# Вывод результирующего датафрейма
+print(combined_df)
