@@ -1,61 +1,73 @@
-import torch
 from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-from datasets import Dataset
-from sklearn.utils.class_weight import compute_class_weight
+from datasets import load_dataset
+import torch
 
-# Загрузка токенизатора и модели BERT
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
+# Загрузка BERT Tokenizer и модели
+model_name = 'bert-base-uncased'
+tokenizer = BertTokenizer.from_pretrained(model_name)
+model = BertForSequenceClassification.from_pretrained(model_name, num_labels=2)
 
-# Пример данных
-data = {
-    "text": ["пример текста 1", "пример текста 2", ...],
-    "label": [0, 1, ...]
-}
+# Подготовка датасета
+# Предположим, что у вас есть датасет с колонками 'text' и 'label'
+dataset = load_dataset('csv', data_files='path/to/your/dataset.csv')
 
-# Создание Dataset объекта
-dataset = Dataset.from_dict(data)
+# Токенизация текста
+def tokenize(batch):
+    return tokenizer(batch['text'], padding=True, truncation=True)
 
-# Функция токенизации
-def tokenize_function(examples):
-    return tokenizer(examples['text'], padding='max_length', truncation=True)
+tokenized_dataset = dataset.map(tokenize, batched=True)
 
-# Применение токенизации
-tokenized_datasets = dataset.map(tokenize_function, batched=True)
+# Взвешивание классов
+class_weights = torch.tensor([0.1, 0.9])  # Пример весов: [вес для класса 0, вес для класса 1]
+class_weights = class_weights.to('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Вычисление весов классов
-class_weights = compute_class_weight('balanced', classes=[0, 1], y=data["label"])
-class_weights_tensor = torch.tensor(class_weights, dtype=torch.float)
+# Переопределение функции потерь
+def compute_loss(outputs, labels):
+    loss_fct = torch.nn.CrossEntropyLoss(weight=class_weights)
+    return loss_fct(outputs.logits, labels)
 
-# Custom Trainer для взвешивания классов
-class WeightedTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.get("labels")
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        
-        # Использование взвешенной потери
-        loss_fct = torch.nn.CrossEntropyLoss(weight=class_weights_tensor)
-        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
-        
-        return (loss, outputs) if return_outputs else loss
-
-# Параметры обучения
+# Настройки тренировки
 training_args = TrainingArguments(
-    output_dir="./results",
-    learning_rate=2e-5,
-    per_device_train_batch_size=16,
+    output_dir='./results',
     num_train_epochs=3,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    warmup_steps=500,
     weight_decay=0.01,
-    logging_dir='./logs'
+    logging_dir='./logs',
+    logging_steps=10,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
 )
 
-# Создание тренера
-trainer = WeightedTrainer(
+trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_datasets,
+    train_dataset=tokenized_dataset['train'],
+    eval_dataset=tokenized_dataset['validation'],
+    compute_metrics=lambda p: {"accuracy": (p.predictions.argmax(-1) == p.label_ids).mean()},
+    loss_fn=compute_loss
 )
 
-# Запуск обучения
+# Обучение модели
 trainer.train()
+
+# Сохранение модели на диск
+trainer.save_model("./trained_bert_model")
+
+# Использование модели для предсказаний
+from transformers import pipeline
+
+# Загрузка сохраненной модели
+model_path = "./trained_bert_model"
+inference_model = BertForSequenceClassification.from_pretrained(model_path)
+inference_tokenizer = BertTokenizer.from_pretrained(model_path)
+
+# Создание пайплайна для предсказаний
+text_classification = pipeline("text-classification", model=inference_model, tokenizer=inference_tokenizer)
+
+# Пример предсказания
+texts = ["Your new text here", "Another text for prediction"]
+predictions = text_classification(texts)
+
+print(predictions)
