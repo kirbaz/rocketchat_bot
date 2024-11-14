@@ -1,91 +1,110 @@
 import pandas as pd
+from collections import defaultdict
 
-# Допустим, у нас есть DataFrame с данными
+# Пример данных
 data = {
-    'абонент1': [1, 2, 3, 4],
-    'абонент2': [5, 6, 7, 8],
-    'группа_абонента1': ['А', 'Б', None, 'В'],
-    'группа_абонента2': [None, 'А', 'Б', 'В'],
-    'фио_абонента1': ['Иванов', 'Петров', None, 'Сидоров'],
-    'фио_абонента2': [None, 'Козлов', 'Смирнов', 'Иванова']
+    'date': ['2024-01-01 06:55:11', '2024-01-02 07:00:00', '2024-01-03 08:00:00', 
+             '2024-01-01 09:00:00', '2024-01-02 10:00:00'],
+    'tlf_call': ['1234567890', '1234567890', '1234567890', '0987654321', '0987654321'],
+    'tlf_to': ['0987654321', '1234567890', '1111111111', '1234567890', '2222222222'],
+    'fio_call': ['Иванов И.И.', 'Иванов И.И.', 'Иванов И.И.', 'Петров П.П.', 'Петров П.П.'],
+    'fio_to': ['Петров П.П.', 'Иванов И.И.', 'Сидоров С.С.', 'Иванов И.И.', 'Сидоров С.С.'],
+    'group_call': [None, None, None, 'Group A', 'Group B'],
+    'group_to': ['Group A', None, 'Group C', None, 'Group C']
 }
 
+# Создаем DataFrame
 df = pd.DataFrame(data)
 
-# Известные группы
-known_groups = ['А', 'Б', 'В']
+# Преобразуем столбец с датами в формат datetime
+df['date'] = pd.to_datetime(df['date'])
 
-# Шаг 1: Выделить абонентов с неизвестной группой
-unknown_group_contacts = df[(df['группа_абонента1'].isna() | df['группа_абонента2'].isna())]
+# Фильтруем абонентов с неизвестной группой
+unknown_group_calls = df[df['group_call'].isnull() | df['group_to'].isnull()]
 
-# Шаг 2: Подсчитать соединения по группам для абонентов с неизвестной группой
-unknown_stats = {}
+# Словари для агрегации
+result = defaultdict(lambda: {
+    'fio_abonents_agg': defaultdict(int),
+    'group_abonents_agg': defaultdict(int),
+    'connect_dates': defaultdict(lambda: {'date_first_connect': None, 'date_last_connect': None})
+})
 
-for index, row in unknown_group_contacts.iterrows():
-    if pd.isna(row['группа_абонента1']):
-        unknown_abonent = row['абонент1']
-        known_group = row['группа_абонента2']
-    else:
-        unknown_abonent = row['абонент2']
-        known_group = row['группа_абонента1']
+# Обрабатываем данные
+for _, row in unknown_group_calls.iterrows():
+    tlf_new = row['tlf_call']
+    date = row['date']
     
-    if known_group in known_groups:
-        if unknown_abonent not in unknown_stats:
-            unknown_stats[unknown_abonent] = {group: 0 for group in known_groups}
-        unknown_stats[unknown_abonent][known_group] += 1
-
-# Шаг 3: Собрать список ФИО абонентов, с которыми связывались неизвестные абоненты, по группам
-fio_by_group = {}
-
-for index, row in unknown_group_contacts.iterrows():
-    if pd.isna(row['группа_абонента1']):
-        unknown_abonent = row['абонент1']
-        known_group = row['группа_абонента2']
-        known_fio = row['фио_абонента2']
-    else:
-        unknown_abonent = row['абонент2']
-        known_group = row['группа_абонента1']
-        known_fio = row['фио_абонента1']
-    
-    if known_group in known_groups:
-        if unknown_abonent not in fio_by_group:
-            fio_by_group[unknown_abonent] = {group: [] for group in known_groups}
-        fio_by_group[unknown_abonent][known_group].append(known_fio)
-
-# Вывод результатов
-print("Статистика соединений неизвестных абонентов по группам:")
-for abonent, stats in unknown_stats.items():
-    print(f"Абонент {abonent}: {stats}")
-
-print("\nСписок ФИО абонентов, с которыми связывались неизвестные абоненты по группам:")
-for abonent, fio_lists in fio_by_group.items():
-    print(f"Абонент {abonent}:")
-    for group, fio_list in fio_lists.items():
-        print(f"  Группа {group}: {fio_list}")
-import pandas as pd
-
-# Создание пустого списка для хранения данных
-combined_data = []
-
-# Объединение данных из unknown_stats и fio_by_group
-for abonent in unknown_stats:
-    stats_row = unknown_stats[abonent]
-    fio_row = fio_by_group[abonent]
-    
-    # Для каждой группы добавляем запись в итоговый датафрейм
-    for group in known_groups:
-        group_stats = stats_row.get(group, 0)
-        fio_list = fio_row.get(group, [])
+    # Если у tlf_call есть группа, используем tlf_to как известный номер
+    if row['group_call'] is not None:
+        tlf_know = row['tlf_to']
+        fio_to = row['fio_to']
+        group_to = row['group_to']
         
-        combined_data.append({
-            'абонент': abonent,
-            'группа': group,
-            'количество соединений': group_stats,
-            'список ФИО': fio_list
+        # Обновляем агрегацию ФИО
+        result[tlf_new]['fio_abonents_agg'][fio_to] += 1
+        
+        # Обновляем агрегацию групп
+        if group_to:
+            result[tlf_new]['group_abonents_agg'][group_to] += 1
+        
+        # Обновляем даты соединений для каждой пары
+        pair_key = (tlf_new, tlf_know)
+        if result[tlf_new]['connect_dates'][pair_key]['date_first_connect'] is None or date < result[tlf_new]['connect_dates'][pair_key]['date_first_connect']:
+            result[tlf_new]['connect_dates'][pair_key]['date_first_connect'] = date
+        if result[tlf_new]['connect_dates'][pair_key]['date_last_connect'] is None or date > result[tlf_new]['connect_dates'][pair_key]['date_last_connect']:
+            result[tlf_new]['connect_dates'][pair_key]['date_last_connect'] = date
+
+    # Если у tlf_to есть группа, используем tlf_call как известный номер
+    elif row['group_to'] is not None:
+        tlf_know = row['tlf_call']
+        fio_to = row['fio_call']
+        group_call = row['group_call']
+        
+        # Обновляем агрегацию ФИО
+        result[tlf_new]['fio_abonents_agg'][fio_to] += 1
+        
+        # Обновляем агрегацию групп
+        if group_call:
+            result[tlf_new]['group_abonents_agg'][group_call] += 1
+        
+        # Обновляем даты соединений для каждой пары
+        pair_key = (tlf_know, tlf_new)
+        if result[tlf_new]['connect_dates'][pair_key]['date_first_connect'] is None or date < result[tlf_new]['connect_dates'][pair_key]['date_first_connect']:
+            result[tlf_new]['connect_dates'][pair_key]['date_first_connect'] = date
+        if result[tlf_new]['connect_dates'][pair_key]['date_last_connect'] is None or date > result[tlf_new]['connect_dates'][pair_key]['date_last_connect']:
+            result[tlf_new]['connect_dates'][pair_key]['date_last_connect'] = date
+
+# Форматируем результат
+formatted_result = []
+for tlf_new, agg_data in result.items():
+    fio_abonents_agg = ', '.join([f"{fio}: {count}" for fio, count in agg_data['fio_abonents_agg'].items()])
+    group_abonents_agg = ', '.join([f"{group}: {count}" for group, count in agg_data['group_abonents_agg'].items()])
+    
+    # Собираем даты соединений для каждой пары
+    connect_dates = []
+    for (caller, receiver), dates in agg_data['connect_dates'].items():
+        connect_dates.append({
+            'pair': f"{caller} - {receiver}",
+            'date_first_connect': dates['date_first_connect'],
+            'date_last_connect': dates['date_last_connect']
         })
+    
+    formatted_result.append({
+        'tlf_new': tlf_new,
+        'fio_abonents_agg': fio_abonents_agg,
+        'group_abonents_agg': group_abonents_agg,
+        'connect_dates': connect_dates
+    })
 
-# Создание результирующего датафрейма
-combined_df = pd.DataFrame(combined_data)
+# Преобразуем в DataFrame для удобного отображения
+result_df = pd.DataFrame(formatted_result)
 
-# Вывод результирующего датафрейма
-print(combined_df)
+# Выводим результат
+for entry in result_df.itertuples(index=False):
+    print(f"Телефон: {entry.tlf_new}")
+    print(f"ФИО абонентов: {entry.fio_abonents_agg}")
+    print(f"Группы абонентов: {entry.group_abonents_agg}")
+    for connect in entry.connect_dates:
+        print(f"Связь: {connect['pair']}, Дата первого соединения: {connect['date_first_connect']}, Дата последнего соединения: {connect['date_last_connect']}")
+    print()
+
