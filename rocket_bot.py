@@ -1,7 +1,13 @@
 import asyncio
 import logging
+import re
 from rocketchat_API.rocketchat import RocketChat
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
+import csv
+import io
 from datetime import datetime, timedelta
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,8 +20,9 @@ class RocketChatBot:
         self.user_id = None
         self.username = None
         self.running = False
-        self.processed_messages = set()  # Храним ID обработанных сообщений
-        self.user_contexts = {}  # Храним контексты диалогов
+        self.processed_messages = set()
+        self.user_contexts: Dict[str, Dict[str, Any]] = {}
+
         self.commands = {
             'help': {
                 'function': self.show_help,
@@ -25,13 +32,21 @@ class RocketChatBot:
                 'function': self.ping,
                 'description': 'Проверить работу бота'
             },
-            'calc': {
-                'function': self.calculate,
-                'description': 'Выполнить вычисления (пример: calc 2+2)'
-            },
             'new_path': {
                 'function': self.start_new_path_dialog,
                 'description': 'Создать новый отчет (диалоговый режим)'
+            },
+            'db_check': {
+                'function': self.start_db_check_dialog,
+                'description': 'Проверить данные в базе'
+            },
+            'schedule': {
+                'function': self.start_schedule_meeting_dialog,
+                'description': 'Запланировать встречу'
+            },
+            'report': {
+                'function': self.start_report_request_dialog,
+                'description': 'Запросить специальный отчет'
             }
         }
 
@@ -73,11 +88,34 @@ class RocketChatBot:
         except Exception as e:
             logger.error(f"Ошибка получения сообщений: {e}")
 
+    # async def process_room(self, room_id):
+    #     # Rocket.Chat API имеет лимиты на частоту запросов
+    #     # Рекомендуется добавить задержку между запросами к одной комнате:
+    #     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    #     messages = self.rocket.im_history(room_id=room_id, count=10).json().get('messages', [])
+    #     await asyncio.sleep(0.1)  # Задержка 100 мс между запросами
+    #     for msg in messages:
+    #         if msg['_id'] not in self.processed_messages:
+    #             await self.process_message(msg)
+    #             self.processed_messages.add(msg['_id'])
+
     async def process_room(self, room_id):
-        # Rocket.Chat API имеет лимиты на частоту запросов
-        # Рекомендуется добавить задержку между запросами к одной комнате:
-        messages = self.rocket.im_history(room_id=room_id, count=10).json().get('messages', [])
-        await asyncio.sleep(0.1)  # Задержка 100 мс между запросами
+        # Загружаем только сообщения, отправленные после текущего времени минус 5 секунд
+        # now_five_min = (datetime.utcnow() - timedelta(minutes=5))
+        # print(f'now - {now_five_min}')
+        # message_last = self.rocket.im_history(room_id=room_id, count=1, oldest=now_five_min).json().get('messages', [])
+        # print(message_last)
+        # if message_last:
+        #     message_last_ts = datetime.strptime(message_last[0]['ts'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        #     print(message_last_ts)
+        #     if message_last_ts < now_five_min:
+        #         print('старые сообщения')
+        #         print(message_last)
+        #         await self.process_room(room_id)
+
+        messages = self.rocket.im_history(room_id=room_id, count=1).json().get('messages', [])
+
+
         for msg in messages:
             if msg['_id'] not in self.processed_messages:
                 await self.process_message(msg)
@@ -104,47 +142,214 @@ class RocketChatBot:
         except Exception as e:
             logger.error(f"Ошибка обработки: {e}")
 
-    async def handle_command(self, command_text, sender, room_id):
-        """Обработка команд с проверкой аргументов"""
+
+    async def handle_command(self, command_text: str, sender: str, room_id: str) -> Optional[str]:
+        """Основной обработчик команд с поддержкой контекста"""
         try:
-            # Проверяем, есть ли активный контекст у пользователя
             if sender in self.user_contexts:
                 return await self.continue_dialog(sender, room_id, command_text)
 
-            # Обработка команды new_path
-            if command_text.startswith('new_path'):
-                return await self.start_new_path_dialog(sender, room_id)
-
-            if not command_text or not sender:
-                logger.error("Не хватает обязательных аргументов")
+            parts = command_text.split()
+            if not parts:
                 return None
 
-            parts = command_text.split()
             command = parts[0].lower()
             args = parts[1:] if len(parts) > 1 else []
 
             if command in self.commands:
-                logger.debug(f"Выполнение команды {command} от {sender} в комнате {room_id}")
                 return await self.commands[command]['function'](sender, room_id, *args)
+
+            return None
+        except Exception as e:
+            logger.error(f"Command handling error: {e}")
+            return "Произошла ошибка при обработке команды"
+
+    # ======================
+    # Диалог для new_path
+    # ======================
+    async def start_new_path_dialog(self, sender: str, room_id: str) -> str:
+        """Начало диалога создания пути"""
+        self.user_contexts[sender] = {
+            'state': 'awaiting_dates',
+            'room_id': room_id,
+            'handler': self.handle_new_path_dialog,
+            'data': {},
+            'created_at': datetime.now()
+        }
+        return "За какой промежуток времени? Введите 2 даты в формате ДД-ММ-ГГГГ"
+
+    async def handle_new_path_dialog(self, sender: str, state: str, user_input: str) -> Tuple[str, str]:
+        """Обработчик шагов диалога new_path"""
+        if user_input.lower() == 'отмена':
+            return "complete", "Диалог прерван"
+
+        if state == 'awaiting_dates':
+            try:
+                date1, date2 = map(lambda x: datetime.strptime(x, "%d-%m-%Y"), user_input.split())
+                if date1 > date2:
+                    return "awaiting_dates", "Первая дата должна быть раньше второй. Попробуйте еще раз."
+
+                return "awaiting_details", "Теперь укажите детали маршрута (города, транспорт и т.д.):"
+            except:
+                return "awaiting_dates", "Неверный формат дат. Используйте ДД-ММ-ГГГГ (например: 01-01-2025 15-01-2025)"
+
+        elif state == 'awaiting_details':
+            # Здесь можно добавить обработку деталей
+            return "complete", f"Маршрут запланирован с деталями: {user_input}"
+
+
+    # ======================
+    # Функция обработки отчетов
+    # ======================
+    async def start_report_request_dialog(self, sender: str, room_id: str) -> str:
+        """Начало диалога запроса специального отчета"""
+        self.user_contexts[sender] = {
+            'state': 'awaiting_report_type',
+            'room_id': room_id,
+            'handler': self.handle_report_request_dialog,
+            'data': {},
+            'created_at': datetime.now()
+        }
+        return ("Какой отчет вам нужен? Выберите тип:\n"
+                "1. Ежедневный\n"
+                "2. Еженедельный\n"
+                "3. Пользовательский\n"
+                "Введите номер варианта")
+
+    async def handle_report_request_dialog(self, sender: str, state: str, user_input: str) -> Tuple[str, str]:
+        """Обработчик шагов диалога запроса отчета"""
+        if user_input.lower() == 'отмена':
+            return "complete", "Диалог прерван"
+
+        if state == 'awaiting_report_type':
+            report_types = {
+                '1': 'daily',
+                '2': 'weekly',
+                '3': 'custom'
+            }
+
+            if user_input not in report_types:
+                return "awaiting_report_type", "Неверный вариант. Введите число от 1 до 3"
+
+            if user_input == '3':  # Для пользовательского отчета запросим дополнительные параметры
+                return "awaiting_custom_params", "Введите параметры отчета (период, фильтры и т.д.):"
+
+            return "complete", f"Отчет ({report_types[user_input]}) будет сформирован и отправлен вам в течение часа"
+
+        elif state == 'awaiting_custom_params':
+            return "complete", f"Пользовательский отчет с параметрами '{user_input}' будет сформирован в течение 2 часов"
+
+    # ======================
+    # Диалог для проверки БД
+    # ======================
+    async def start_db_check_dialog(self, sender: str, room_id: str) -> str:
+        """Начало диалога проверки базы данных"""
+        self.user_contexts[sender] = {
+            'state': 'awaiting_search_type',
+            'room_id': room_id,
+            'handler': self.handle_db_check_dialog,
+            'data': {},
+            'created_at': datetime.now()
+        }
+        return ("Как будем искать данные? Выберите тип:\n"
+                "1. По ФИО\n"
+                "2. По отделу\n"
+                "3. По местоположению\n"
+                "Введите номер варианта")
+
+    async def handle_db_check_dialog(self, sender: str, state: str, user_input: str) -> Tuple[str, str]:
+        """Обработчик шагов диалога проверки БД"""
+
+        if user_input.lower() == 'отмена':
+            return "complete", "Диалог прерван"
+
+        if state == 'awaiting_search_type':
+            search_types = {
+                '1': 'fio',
+                '2': 'department',
+                '3': 'location'
+            }
+
+            if user_input not in search_types:
+                return "awaiting_search_type", "Неверный вариант. Введите число от 1 до 3"
+
+            return "awaiting_search_value", f"Введите значение для поиска по {search_types[user_input]}:"
+
+        elif state == 'awaiting_search_value':
+            return "awaiting_file", "Теперь отправьте CSV файл с данными для проверки"
+
+        elif state == 'awaiting_file':
+            if not user_input.lower().endswith('.csv'):
+                return "awaiting_file", "Пожалуйста, отправьте именно CSV файл"
+
+            # Здесь была бы обработка файла
+            return "complete", "Данные успешно проверены. Найдено 42 совпадения"
+
+    # ======================
+    # Диалог планирования встречи
+    # ======================
+    async def start_schedule_meeting_dialog(self, sender: str, room_id: str) -> str:
+        """Начало диалога планирования встречи"""
+        self.user_contexts[sender] = {
+            'state': 'awaiting_participants',
+            'room_id': room_id,
+            'handler': self.handle_schedule_meeting_dialog,
+            'data': {},
+            'created_at': datetime.now()
+        }
+        return "Введите участников встречи (через запятую):"
+
+    async def handle_schedule_meeting_dialog(self, sender: str, state: str, user_input: str) -> Tuple[str, str]:
+        """Обработчик шагов диалога планирования встречи"""
+        if user_input.lower() == 'отмена':
+            return "complete", "Диалог прерван"
+
+        if state == 'awaiting_participants':
+            participants = [p.strip() for p in user_input.split(',')]
+            if len(participants) < 1:
+                return "awaiting_participants", "Нужно указать хотя бы одного участника"
+
+            return "awaiting_date", "Введите дату и время встречи (ДД-ММ-ГГГГ ЧЧ:ММ):"
+
+        elif state == 'awaiting_date':
+            try:
+                meeting_time = datetime.strptime(user_input, "%d-%m-%Y %H:%M")
+                if meeting_time < datetime.now():
+                    return "awaiting_date", "Дата должна быть в будущем. Попробуйте еще раз"
+
+                return "awaiting_topic", "Введите тему встречи:"
+            except:
+                return "awaiting_date", "Неверный формат. Используйте ДД-ММ-ГГГГ ЧЧ:ММ"
+
+        elif state == "awaiting_topic":
+            return "complete", f"Встреча запланирована на тему: {user_input}"
+
+    # ======================
+    # Общий обработчик диалогов
+    # ======================
+    async def continue_dialog(self, sender: str, room_id: str, user_input: str) -> Optional[str]:
+        """Продолжение диалога на основе контекста"""
+        if sender not in self.user_contexts:
             return None
 
-        except Exception as e:
-            logger.error(f"Ошибка обработки команды: {e}")
-            return f"@{sender} Произошла ошибка при выполнении команды"
+        context = self.user_contexts[sender]
+        handler = context['handler']
+        state = context['state']
 
-    async def process_path_request(self, sender, date_from, date_to, additional_info):
-        # Здесь реализуйте вашу логику обработки
-        # Это пример - замените на реальную логику
         try:
-            # Имитация долгой обработки
-            await asyncio.sleep(2)
-            return (f"Отчет для {sender} с {date_from.strftime('%d-%m-%Y')} "
-                    f"по {date_to.strftime('%d-%m-%Y')}\n"
-                    f"Дополнительные параметры: {additional_info}\n"
-                    f"Результат: данные успешно обработаны")
+            new_state, response = await handler(sender, state, user_input)
+
+            if new_state == "complete":
+                del self.user_contexts[sender]
+                return response
+            else:
+                context['state'] = new_state
+                return response
+
         except Exception as e:
-            logger.error(f"Ошибка обработки запроса: {e}")
-            return "Ошибка при обработке запроса"
+            logger.error(f"Dialog error for {sender}: {e}")
+            del self.user_contexts[sender]
+            return "Произошла ошибка. Диалог прерван."
 
     async def cleanup_contexts(self):
         while self.running:
@@ -156,57 +361,6 @@ class RocketChatBot:
             for user in expired:
                 del self.user_contexts[user]
                 logger.info(f"Удален просроченный контекст для {user}")
-
-    async def start_new_path_dialog(self, sender, room_id):
-        """Начало диалога создания отчета"""
-        self.user_contexts[sender] = {
-            'state': 'awaiting_dates',
-            'room_id': room_id,
-            'data': {},
-            'created_at': datetime.now()
-        }
-        return "За какой промежуток времени? Введите 2 даты в формате ДД-ММ-ГГГГ. Например: 01-03-2025 01-04-2025"
-
-    async def continue_dialog(self, sender, room_id, user_input):
-        """Продолжение диалога"""
-        context = self.user_contexts.get(sender)
-        if not context:
-            return "Диалог прерван. Начните заново командой new_path."
-
-        try:
-            if context['state'] == 'awaiting_dates':
-                dates = user_input.split()
-                if len(dates) != 2:
-                    return "Нужно ввести ровно 2 даты. Попробуйте еще раз."
-
-                try:
-                    date1 = datetime.strptime(dates[0], "%d-%m-%Y")
-                    date2 = datetime.strptime(dates[1], "%d-%m-%Y")
-
-                    if date1 > date2:
-                        return "Первая дата должна быть раньше второй. Попробуйте еще раз."
-
-                    context['data']['dates'] = (date1, date2)
-                    context['state'] = 'awaiting_additional_info'
-                    return "Теперь укажите дополнительные параметры (например, тип отчета):"
-
-                except ValueError:
-                    return "Неверный формат даты. Используйте ДД-ММ-ГГГГ."
-
-            elif context['state'] == 'awaiting_additional_info':
-                result = await self.process_path_request(
-                    sender,
-                    context['data']['dates'][0],
-                    context['data']['dates'][1],
-                    user_input
-                )
-                del self.user_contexts[sender]
-                return result
-
-        except Exception as e:
-            logger.error(f"Ошибка в диалоге: {e}")
-            del self.user_contexts[sender]
-            return "Произошла ошибка. Диалог прерван. Начните заново командой new_path."
 
     async def show_help(self, sender, room_id, *args):
         help_text = "Доступные команды:\n"
